@@ -27,6 +27,27 @@ NEW_BROKEN = {"name": "isol", "version": "v2", "start": "LOCKED", "states": {
     "OPEN":   {"output": "绿灯", "actions": {"lock": "LOCKED"}},
     "TRIPPED": {"output": "黄灯", "actions": {"reset": "LOCKED"}},
 }}
+OLD_FOLDED = {"name": "isol", "version": "v1", "start": "SEALED_A", "states": {
+    "SEALED_A": {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "SEALED_B": {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "RUNNING":  {"output": "运行", "actions": {"seal": "SEALED_A"}},
+}}
+NEW_FOLDED = {"name": "isol", "version": "v2", "start": "SEALED", "states": {
+    "SEALED":  {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "RUNNING": {"output": "运行", "actions": {"seal": "SEALED"}},
+}}
+OLD_FOLDED_BROKEN = {"name": "isol", "version": "v1", "start": "SEALED_A", "states": {
+    "SEALED_A": {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "SEALED_B": {"output": "封闭", "actions": {"open": "RUNNING_HOT"}},
+    "RUNNING":  {"output": "运行", "actions": {"seal": "SEALED_A"}},
+    "RUNNING_HOT": {"output": "过热", "actions": {"seal": "SEALED_B"}},
+}}
+FOLDED_SESSIONS = [
+    {"session_id": "S1", "spec_version": "v1", "state": "SEALED_A",
+     "target_state": "SEALED", "observed_output": "封闭"},
+    {"session_id": "S2", "spec_version": "v1", "state": "SEALED_B",
+     "target_state": "SEALED", "observed_output": "封闭"},
+]
 
 
 class HttpSmokeTest(unittest.TestCase):
@@ -141,6 +162,56 @@ class HttpSmokeTest(unittest.TestCase):
         self.request("/api/decisions/NOPE", "GET", expect=404)
         self.request("/api/decisions/NOPE/publish", "POST",
                      {"snapshot_hash": "x"}, expect=409)
+
+    def test_07_folded_target_two_sessions_publish(self):
+        """两个行为等价的旧状态会话迁入同一新状态：可发布且证据各自独立。"""
+        body = {"migration_id": "HTTP-FOLD", "old_spec": OLD_FOLDED,
+                "new_spec": NEW_FOLDED, "sessions": FOLDED_SESSIONS}
+        status, rec = self.request("/api/decisions/freeze", "POST", body, 200)
+        self.assertTrue(rec["verdict"]["publishable"])
+        self.assertEqual(
+            {(s["session_id"], s["target_state"], s["ok"])
+             for s in rec["verdict"]["sessions"]},
+            {("S1", "SEALED", True), ("S2", "SEALED", True)})
+        h = rec["snapshot_hash"]
+        status, pub = self.request("/api/decisions/HTTP-FOLD/publish", "POST",
+                                   {"snapshot_hash": h}, 200)
+        self.assertEqual(pub["stage"], "PUBLISHED")
+        # 发布后查询：同一已发布结论，含两份会话证据
+        status, got = self.request("/api/decisions/HTTP-FOLD", expect=200)
+        self.assertEqual(got["stage"], "PUBLISHED")
+        self.assertEqual(got["snapshot_hash"], h)
+        self.assertEqual({s["session_id"] for s in got["verdict"]["sessions"]},
+                         {"S1", "S2"})
+        # 相同稳定标识的等价重传：返回同一已发布结论
+        status, again = self.request("/api/decisions/freeze", "POST", body, 200)
+        self.assertEqual(again["stage"], "PUBLISHED")
+        self.assertEqual(again["snapshot_hash"], h)
+        # 交换会话录入顺序（另一标识）：裁决结果不变
+        swapped = {"migration_id": "HTTP-FOLD-SWAP", "old_spec": OLD_FOLDED,
+                   "new_spec": NEW_FOLDED,
+                   "sessions": list(reversed(FOLDED_SESSIONS))}
+        status, swp = self.request("/api/decisions/freeze", "POST", swapped, 200)
+        self.assertTrue(swp["verdict"]["publishable"])
+        verdicts = lambda r: {s["session_id"]: (s["ok"], s["target_state"])
+                              for s in r["verdict"]["sessions"]}
+        self.assertEqual(verdicts(swp), verdicts(rec))
+
+    def test_08_folded_target_successor_mismatch_rejected(self):
+        """共享目标状态的会话中一个后继不匹配：整个候选被拒绝。"""
+        body = {"migration_id": "HTTP-FOLD-BAD", "old_spec": OLD_FOLDED_BROKEN,
+                "new_spec": NEW_FOLDED, "sessions": FOLDED_SESSIONS}
+        status, rec = self.request("/api/decisions/freeze", "POST", body, 200)
+        self.assertFalse(rec["verdict"]["publishable"])
+        bad = [s for s in rec["verdict"]["sessions"] if not s["ok"]]
+        self.assertEqual(len(bad), 1)
+        self.assertEqual(bad[0]["session_id"], "S2")
+        self.assertEqual(bad[0]["blocking_path"][-1]["reason"],
+                         "output_mismatch")
+        status, err = self.request("/api/decisions/HTTP-FOLD-BAD/publish",
+                                   "POST",
+                                   {"snapshot_hash": rec["snapshot_hash"]}, 409)
+        self.assertEqual(err["error"], "not_publishable")
 
 
 if __name__ == "__main__":

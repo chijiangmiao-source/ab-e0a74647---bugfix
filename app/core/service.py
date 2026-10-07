@@ -72,31 +72,10 @@ class DecisionService:
 
         result = compute_bisimulation(old, new, sessions)
         verdict = result.to_json()
-        claimed_targets: Dict[str, str] = {}
-        for session_verdict in verdict["sessions"]:
-            target_state = session_verdict["target_state"]
-            if not session_verdict["ok"] or target_state is None:
-                continue
-            previous_session = claimed_targets.get(target_state)
-            if previous_session is None:
-                claimed_targets[target_state] = session_verdict["session_id"]
-                continue
-            session_verdict["ok"] = False
-            session_verdict["target_state"] = None
-            session_verdict["blocking_path"] = [{
-                "step": 1,
-                "old_state": next(
-                    s.state for s in sessions
-                    if s.session_id == session_verdict["session_id"]
-                ),
-                "new_state": target_state,
-                "action": None,
-                "to_old": None,
-                "to_new": None,
-                "reason": "target_already_claimed",
-                "detail": f"目标状态 {target_state!r} 已由会话 {previous_session!r} 预留",
-            }]
-        verdict["publishable"] = all(item["ok"] for item in verdict["sessions"])
+        # 新规程允许把多个行为等价的旧状态折叠为同一个新状态：若干会话
+        # 共享同一 target_state 是合法的，每个会话各自保留独立的迁移证据，
+        # 只要各自 (旧当前状态, 目标状态) 种子对都在最大双向匹配关系内，
+        # 候选即可发布——裁决结果与会话录入顺序无关。
         # 映射证据：匹配状态对 + 逐会话结论
         verdict["evidence"] = {
             "rule": "greatest bisimulation over reachable pairs "

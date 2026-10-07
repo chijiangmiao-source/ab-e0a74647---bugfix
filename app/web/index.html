@@ -63,6 +63,7 @@ pre.json { background:#0c1220; border:1px solid var(--line); border-radius:8px;
   <span id="health" class="badge">健康检测中…</span>
   <span class="spacer"></span>
   <button class="ghost" id="btn-example-ok">填充示例：可迁移</button>
+  <button class="ghost" id="btn-example-fold">填充示例：等价折叠</button>
   <button class="ghost" id="btn-example-miss">填充示例：动作缺失</button>
 </header>
 
@@ -233,6 +234,22 @@ const EXAMPLES = {
     ],
     mid: "cutover-2026-10-07-ok",
   },
+  fold: {
+    old: { name: "isol", version: "v1", start: "SEALED_A", states: [
+      ["SEALED_A", "封闭", { open: "RUNNING" }],
+      ["SEALED_B", "封闭", { open: "RUNNING" }],
+      ["RUNNING", "运行", { seal: "SEALED_A" }],
+    ]},
+    neu: { name: "isol", version: "v2", start: "SEALED", states: [
+      ["SEALED", "封闭", { open: "RUNNING" }],
+      ["RUNNING", "运行", { seal: "SEALED" }],
+    ]},
+    sessions: [
+      ["S-101", "v1", "SEALED_A", "SEALED", "封闭"],
+      ["S-102", "v1", "SEALED_B", "SEALED", "封闭"],
+    ],
+    mid: "cutover-2026-10-07-fold",
+  },
   miss: {
     old: { name: "isol", version: "v1", start: "LOCKED", states: [
       ["LOCKED", "红灯", { unlock: "OPEN" }],
@@ -264,11 +281,12 @@ function loadExample(key) {
         Object.entries(a).map(([k, v]) => `${k}:${v}`).join("\n")));
   });
   $("sessions").innerHTML = "";
-  ex.sessions.forEach(([id, ver, st, out, tgt]) => sessRow(id, ver, st, tgt || "", out));
+  ex.sessions.forEach(([id, ver, st, tgt, out]) => sessRow(id, ver, st, tgt || "", out));
   $("migration-id").value = ex.mid;
   $("error").textContent = "";
 }
 $("btn-example-ok").onclick = () => loadExample("ok");
+$("btn-example-fold").onclick = () => loadExample("fold");
 $("btn-example-miss").onclick = () => loadExample("miss");
 
 /* ---------- 裁决结果渲染 ---------- */

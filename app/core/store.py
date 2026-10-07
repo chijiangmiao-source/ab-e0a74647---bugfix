@@ -95,8 +95,8 @@ class Store:
           * 载荷哈希不同 —— 409（会话快照或规程被混用）。
         """
         with self._write_lock:
-            self._conn.execute("BEGIN IMMEDIATE")
             try:
+                self._conn.execute("BEGIN IMMEDIATE")
                 row = self._conn.execute(
                     "SELECT * FROM decisions WHERE migration_id=?",
                     (migration_id,),
@@ -109,6 +109,8 @@ class Store:
                             "禁止混用",
                             existing=_row_to_dict(row),
                         )
+                    # 幂等重传：结束本次事务，避免连接上残留未提交事务
+                    self._conn.commit()
                     return row["stage"], _row_to_dict(row)
 
                 now = _utcnow()
@@ -141,8 +143,8 @@ class Store:
     ) -> Dict[str, Any]:
         """把冻结裁决发布。调用方须已确认裁决 publishable。"""
         with self._write_lock:
-            self._conn.execute("BEGIN IMMEDIATE")
             try:
+                self._conn.execute("BEGIN IMMEDIATE")
                 row = self._conn.execute(
                     "SELECT * FROM decisions WHERE migration_id=?",
                     (migration_id,),
@@ -160,6 +162,8 @@ class Store:
                             "禁止混用",
                             existing=_row_to_dict(row),
                         )
+                    # 幂等重传：结束本次事务，避免连接上残留未提交事务
+                    self._conn.commit()
                     return _row_to_dict(row)  # 幂等重传
                 if row["snapshot_hash"] != snapshot_hash:
                     raise ConflictError(
@@ -174,19 +178,8 @@ class Store:
                         f"迁移标识 {migration_id!r} 存在不可映射会话，候选不得发布",
                         existing=_row_to_dict(row),
                     )
-                seen_targets: Dict[str, str] = {}
-                for session in json.loads(row["sessions"]):
-                    target_state = session["target_state"]
-                    previous_session = seen_targets.get(target_state)
-                    if previous_session is None:
-                        seen_targets[target_state] = session["session_id"]
-                        continue
-                    raise ConflictError(
-                        "target_collision",
-                        f"目标状态 {target_state!r} 同时分配给会话 "
-                        f"{previous_session!r} 与 {session['session_id']!r}",
-                        existing=_row_to_dict(row),
-                    )
+                # 多个会话迁入同一目标状态是合法的（新规程折叠等价旧状态）；
+                # 可发布性完全由冻结时算出的最大双向匹配裁决保证。
                 self._conn.execute(
                     "UPDATE decisions SET stage='PUBLISHED', published_at=? "
                     "WHERE migration_id=? AND stage='FROZEN'",

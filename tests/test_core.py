@@ -33,6 +33,24 @@ OLD = {
     "TRIPPED": {"output": "黄灯", "actions": {"reset": "LOCKED"}},
 }
 
+# 等价折叠骨架：旧规程两个名称不同但行为等价的状态，新规程折叠为同一状态
+OLD_FOLDED = {
+    "SEALED_A": {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "SEALED_B": {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "RUNNING":  {"output": "运行", "actions": {"seal": "SEALED_A"}},
+}
+NEW_FOLDED = {
+    "SEALED":  {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "RUNNING": {"output": "运行", "actions": {"seal": "SEALED"}},
+}
+# SEALED_B 的 open 后继输出与新规程不一致：行为不再等价
+OLD_FOLDED_BROKEN = {
+    "SEALED_A": {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "SEALED_B": {"output": "封闭", "actions": {"open": "RUNNING_HOT"}},
+    "RUNNING":  {"output": "运行", "actions": {"seal": "SEALED_A"}},
+    "RUNNING_HOT": {"output": "过热", "actions": {"seal": "SEALED_B"}},
+}
+
 
 class MigratableTests(unittest.TestCase):
     def test_identical_specs_all_seeds_match(self):
@@ -177,6 +195,66 @@ class NotJustStartStateTests(unittest.TestCase):
         by_id = {s.session_id: s for s in res.sessions}
         self.assertTrue(by_id["ok"].ok)
         self.assertFalse(by_id["bad"].ok)
+
+
+class FoldedTargetTests(unittest.TestCase):
+    """新规程把多个行为等价的旧状态折叠为同一个新状态。"""
+
+    def test_two_equivalent_old_states_fold_into_one_new_state(self):
+        old, _ = make_spec("isol", "SEALED_A", OLD_FOLDED, "v1")
+        new, _ = make_spec("isol", "SEALED", NEW_FOLDED, "v2")
+        sessions = [
+            snap("S1", "SEALED_A", target="SEALED", observed="封闭"),
+            snap("S2", "SEALED_B", target="SEALED", observed="封闭"),
+        ]
+        res = compute_bisimulation(old, new, sessions)
+        self.assertTrue(res.publishable)
+        # 两个会话各自保留独立的迁移证据，并得到同一个目标状态
+        self.assertEqual(len(res.sessions), 2)
+        by_id = {s.session_id: s for s in res.sessions}
+        self.assertTrue(by_id["S1"].ok)
+        self.assertTrue(by_id["S2"].ok)
+        self.assertEqual(by_id["S1"].target_state, "SEALED")
+        self.assertEqual(by_id["S2"].target_state, "SEALED")
+        # 两个种子对都在最大双向匹配关系内
+        pairs = {(p["old_state"], p["new_state"]) for p in res.pairs}
+        self.assertIn(("SEALED_A", "SEALED"), pairs)
+        self.assertIn(("SEALED_B", "SEALED"), pairs)
+
+    def test_session_entry_order_does_not_change_verdict(self):
+        old, _ = make_spec("isol", "SEALED_A", OLD_FOLDED, "v1")
+        new, _ = make_spec("isol", "SEALED", NEW_FOLDED, "v2")
+        forward = [snap("S1", "SEALED_A", target="SEALED"),
+                   snap("S2", "SEALED_B", target="SEALED")]
+        swapped = list(reversed(forward))
+        res_fwd = compute_bisimulation(old, new, forward)
+        res_swp = compute_bisimulation(old, new, swapped)
+        self.assertEqual(res_fwd.publishable, res_swp.publishable)
+        verdicts = lambda res: {
+            s.session_id: (s.ok, s.target_state) for s in res.sessions}
+        self.assertEqual(verdicts(res_fwd), verdicts(res_swp))
+        self.assertEqual(res_fwd.pairs, res_swp.pairs)
+
+    def test_folded_candidate_with_broken_successor_still_blocks(self):
+        """共享目标状态的两个会话中一个后继不匹配：整个候选仍须拒绝。"""
+        old, _ = make_spec("isol", "SEALED_A", OLD_FOLDED_BROKEN, "v1")
+        new, _ = make_spec("isol", "SEALED", NEW_FOLDED, "v2")
+        sessions = [
+            snap("S1", "SEALED_A", target="SEALED", observed="封闭"),
+            snap("S2", "SEALED_B", target="SEALED", observed="封闭"),
+        ]
+        res = compute_bisimulation(old, new, sessions)
+        self.assertFalse(res.publishable)
+        by_id = {s.session_id: s for s in res.sessions}
+        # 行为等价的会话不受影响
+        self.assertTrue(by_id["S1"].ok)
+        self.assertEqual(by_id["S1"].target_state, "SEALED")
+        # 后继不匹配的会话给出首个阻断路径：沿 open 下钻到输出冲突
+        bad = by_id["S2"]
+        self.assertFalse(bad.ok)
+        self.assertIsNone(bad.target_state)
+        self.assertEqual(bad.blocking_path[0].action, "open")
+        self.assertEqual(bad.blocking_path[-1].reason, "output_mismatch")
 
 
 class StaleSnapshotTests(unittest.TestCase):

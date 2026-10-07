@@ -3,12 +3,13 @@
 运行顺序（任一步失败即记录并最终以非零退出码结束）：
 
   1. 构建检查：compileall 编译全部源码/测试；
-  2. 规则测试：unittest 全套（可迁移 / 动作缺失 / 非仅起始状态比较 /
-     陈旧快照 / 并发竞争 / 崩溃恢复 / HTTP 冒烟）；
+  2. 规则测试：unittest 全套（可迁移 / 动作缺失 / 等价折叠 / 非仅起始状态
+     比较 / 陈旧快照 / 并发竞争 / 崩溃恢复 / HTTP 冒烟）；
   3. 对 Compose 中正在运行的 app 服务做真实 API/HTTP 冒烟，
-     覆盖一组三类案例：可迁移、动作缺失、并发陈旧快照；
+     覆盖：可迁移、动作缺失、并发陈旧快照、等价折叠共享目标状态
+     （含交换会话顺序、发布重传）、折叠候选中后继不匹配被拒；
   4. 进程级中断恢复演练：冻结后“杀死”重开 => 未发布；
-     发布后“杀死”重开 => 唯一已发布结论。
+     发布后“杀死”重开 => 唯一已发布结论（含两份会话证据）。
 
 完成一次后打印汇总并以退出码报告，容器随即退出，不重启。
 """
@@ -41,6 +42,29 @@ NEW_MISSING = {"name": "isol", "version": "v2", "start": "LOCKED", "states": {
                                             "force_open": "OPEN"}},
     "TRIPPED": {"output": "黄灯", "actions": {"reset": "LOCKED"}},
 }}
+# 等价折叠：两个名称不同但行为等价的旧状态，新规程折叠为同一目标状态
+OLD_FOLDED = {"name": "isol", "version": "v1", "start": "SEALED_A", "states": {
+    "SEALED_A": {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "SEALED_B": {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "RUNNING":  {"output": "运行", "actions": {"seal": "SEALED_A"}},
+}}
+NEW_FOLDED = {"name": "isol", "version": "v2", "start": "SEALED", "states": {
+    "SEALED":  {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "RUNNING": {"output": "运行", "actions": {"seal": "SEALED"}},
+}}
+OLD_FOLDED_BROKEN = {"name": "isol", "version": "v1", "start": "SEALED_A",
+                     "states": {
+    "SEALED_A": {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "SEALED_B": {"output": "封闭", "actions": {"open": "RUNNING_HOT"}},
+    "RUNNING":  {"output": "运行", "actions": {"seal": "SEALED_A"}},
+    "RUNNING_HOT": {"output": "过热", "actions": {"seal": "SEALED_B"}},
+}}
+FOLDED_SESSIONS = [
+    {"session_id": "S1", "spec_version": "v1", "state": "SEALED_A",
+     "target_state": "SEALED", "observed_output": "封闭"},
+    {"session_id": "S2", "spec_version": "v1", "state": "SEALED_B",
+     "target_state": "SEALED", "observed_output": "封闭"},
+]
 
 
 def step(title: str) -> None:
@@ -177,6 +201,55 @@ def check_http_smoke() -> bool:
     expect(status == 409 and wrong["error"] == "snapshot_mismatch",
            "案例C 错误快照哈希发布 => 409 拒绝")
 
+    # --- 案例 D：等价折叠——两个会话共享同一目标状态 -------------------
+    status, rec = http("POST", "/api/decisions/freeze", {
+        "migration_id": "VER-FOLD", "old_spec": OLD_FOLDED,
+        "new_spec": NEW_FOLDED, "sessions": FOLDED_SESSIONS})
+    expect(status == 200 and rec["verdict"]["publishable"],
+           "案例D 等价折叠：两个旧状态会话均可迁入同一新状态")
+    targets = {s["session_id"]: (s["ok"], s["target_state"])
+               for s in rec["verdict"]["sessions"]}
+    expect(targets == {"S1": (True, "SEALED"), "S2": (True, "SEALED")},
+           "案例D 两份会话证据独立保留且目标状态同为 SEALED")
+    fold_hash = rec["snapshot_hash"]
+    status, pub = http("POST", "/api/decisions/VER-FOLD/publish",
+                       {"snapshot_hash": fold_hash})
+    expect(status == 200 and pub["stage"] == "PUBLISHED",
+           "案例D 共享目标状态的候选发布成功")
+    status, again = http("POST", "/api/decisions/freeze", {
+        "migration_id": "VER-FOLD", "old_spec": OLD_FOLDED,
+        "new_spec": NEW_FOLDED, "sessions": FOLDED_SESSIONS})
+    expect(status == 200 and again["snapshot_hash"] == fold_hash
+           and again["stage"] == "PUBLISHED",
+           "案例D 同标识等价重传返回同一已发布结论")
+    status, got = http("GET", "/api/decisions/VER-FOLD")
+    expect(status == 200 and got["stage"] == "PUBLISHED"
+           and {s["session_id"] for s in got["verdict"]["sessions"]}
+           == {"S1", "S2"},
+           "案例D 发布后重查得到含两份会话证据的唯一结论")
+    status, swapped = http("POST", "/api/decisions/freeze", {
+        "migration_id": "VER-FOLD-SWAP", "old_spec": OLD_FOLDED,
+        "new_spec": NEW_FOLDED, "sessions": list(reversed(FOLDED_SESSIONS))})
+    swapped_targets = {s["session_id"]: (s["ok"], s["target_state"])
+                       for s in swapped["verdict"]["sessions"]}
+    expect(status == 200 and swapped["verdict"]["publishable"]
+           and swapped_targets == targets,
+           "案例D 交换会话录入顺序裁决结果不变")
+
+    # --- 案例 E：折叠候选中一个会话后继不匹配 => 整体拒绝 -------------
+    status, rec = http("POST", "/api/decisions/freeze", {
+        "migration_id": "VER-FOLD-BAD", "old_spec": OLD_FOLDED_BROKEN,
+        "new_spec": NEW_FOLDED, "sessions": FOLDED_SESSIONS})
+    bad = [s for s in rec["verdict"]["sessions"] if not s["ok"]]
+    expect(status == 200 and not rec["verdict"]["publishable"]
+           and len(bad) == 1 and bad[0]["session_id"] == "S2"
+           and bad[0]["blocking_path"][-1]["reason"] == "output_mismatch",
+           "案例E 后继不匹配的会话阻断整个候选并给出首个阻断路径")
+    status, err = http("POST", "/api/decisions/VER-FOLD-BAD/publish",
+                       {"snapshot_hash": rec["snapshot_hash"]})
+    expect(status == 409 and err["error"] == "not_publishable",
+           "案例E 阻断候选发布被拒绝（409 not_publishable）")
+
     return not failures
 
 
@@ -225,38 +298,42 @@ def check_recovery() -> bool:
         print("冻结后中断、重开 => 恢复为未发布")
         ok &= cond
 
-        # 进程 3：冻结 RC-2 并发布后退出（切换完成）
+        # 进程 3：冻结 RC-2（两个等价旧状态会话共享同一目标状态）并发布后退出
         p = run_subprocess(
             "import sys; "
-            "OLD=%r; NEW=%r; "
+            "OLD=%r; NEW=%r; SESS=%r; "
             "s=Store(sys.argv[1]); svc=DecisionService(s); "
-            "r=svc.freeze('RC-2', OLD, NEW, [{'session_id':'S1',"
-            "'spec_version':'v1','state':'LOCKED','observed_output':'红灯'}]); "
+            "r=svc.freeze('RC-2', OLD, NEW, SESS); "
             "svc.publish('RC-2', r['snapshot_hash']); "
             "print(r['snapshot_hash']); s.close()"
-            % (OLD, NEW))
+            % (OLD_FOLDED, NEW_FOLDED, FOLDED_SESSIONS))
         h = p.stdout.strip().splitlines()[-1] if p.returncode == 0 else ""
         cond = bool(h)
         if not cond:
             print(p.stderr)
-        # 进程 4：重开，已发布结论须原样保留且唯一
+        # 进程 4：重开，已发布结论须原样保留且唯一（含两份会话证据）
         p2 = run_subprocess(
             "import sys,json; s=Store(sys.argv[1]); s.recover_interrupted(); "
             "r=s.get('RC-2'); "
             "print(json.dumps({'stage':r['stage'],'hash':r['snapshot_hash'],"
             "'oldver':r['old_summary']['version'],"
             "'sessions':len(r['sessions']),"
+            "'targets':sorted((v['session_id'], v['ok'], v['target_state'])"
+            "                 for v in r['verdict']['sessions']),"
             "'publishable':r['verdict']['publishable']})); s.close()")
         if p2.returncode == 0:
             out = json.loads(p2.stdout.strip().splitlines()[-1])
             cond &= (out["stage"] == "PUBLISHED" and out["hash"] == h
-                     and out["oldver"] == "v1" and out["sessions"] == 1
+                     and out["oldver"] == "v1" and out["sessions"] == 2
+                     and out["targets"] == [["S1", True, "SEALED"],
+                                            ["S2", True, "SEALED"]]
                      and out["publishable"] is True)
         else:
             cond = False
             print(p2.stderr)
         print("  ✓ " if cond else "  ✗ ", end="")
-        print("切换后中断、重开 => 唯一已发布结论（摘要/会话/证据完整绑定）")
+        print("切换后中断、重开 => 唯一已发布结论"
+              "（摘要/两份会话证据/折叠目标完整绑定）")
         ok &= cond
     return ok
 

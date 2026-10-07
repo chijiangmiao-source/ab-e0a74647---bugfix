@@ -35,6 +35,29 @@ SESSIONS_OK = [
      "observed_output": "绿灯"},
 ]
 
+# 等价折叠：两个行为等价的旧状态会话共享新规程的同一目标状态
+OLD_FOLDED = {"name": "isol", "version": "v1", "start": "SEALED_A", "states": {
+    "SEALED_A": {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "SEALED_B": {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "RUNNING":  {"output": "运行", "actions": {"seal": "SEALED_A"}},
+}}
+NEW_FOLDED = {"name": "isol", "version": "v2", "start": "SEALED", "states": {
+    "SEALED":  {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "RUNNING": {"output": "运行", "actions": {"seal": "SEALED"}},
+}}
+OLD_FOLDED_BROKEN = {"name": "isol", "version": "v1", "start": "SEALED_A", "states": {
+    "SEALED_A": {"output": "封闭", "actions": {"open": "RUNNING"}},
+    "SEALED_B": {"output": "封闭", "actions": {"open": "RUNNING_HOT"}},
+    "RUNNING":  {"output": "运行", "actions": {"seal": "SEALED_A"}},
+    "RUNNING_HOT": {"output": "过热", "actions": {"seal": "SEALED_B"}},
+}}
+SESSIONS_FOLDED = [
+    {"session_id": "S1", "spec_version": "v1", "state": "SEALED_A",
+     "target_state": "SEALED", "observed_output": "封闭"},
+    {"session_id": "S2", "spec_version": "v1", "state": "SEALED_B",
+     "target_state": "SEALED", "observed_output": "封闭"},
+]
+
 
 class StoreTestBase(unittest.TestCase):
     def setUp(self):
@@ -188,6 +211,72 @@ class CrashRecoveryTests(StoreTestBase):
         row = store2.get("M-C3")
         self.assertIn(row["stage"], ("FROZEN", "PUBLISHED"))
         self.assertEqual(row["stage"], "PUBLISHED")
+
+
+class FoldedTargetPublishTests(StoreTestBase):
+    """等价折叠：两个会话共享同一目标状态，各自保留独立迁移证据。"""
+
+    def test_shared_target_freezes_publishable_and_publishes(self):
+        rec = self.svc.freeze("M-F1", OLD_FOLDED, NEW_FOLDED, SESSIONS_FOLDED)
+        self.assertTrue(rec["verdict"]["publishable"])
+        verdicts = {s["session_id"]: s for s in rec["verdict"]["sessions"]}
+        self.assertEqual(set(verdicts), {"S1", "S2"})
+        for sv in verdicts.values():
+            self.assertTrue(sv["ok"])
+            self.assertEqual(sv["target_state"], "SEALED")
+        pub = self.svc.publish("M-F1", rec["snapshot_hash"])
+        self.assertEqual(pub["stage"], "PUBLISHED")
+
+    def test_session_entry_order_does_not_change_verdict(self):
+        a = self.svc.freeze("M-F2A", OLD_FOLDED, NEW_FOLDED, SESSIONS_FOLDED)
+        b = self.svc.freeze("M-F2B", OLD_FOLDED, NEW_FOLDED,
+                            list(reversed(SESSIONS_FOLDED)))
+        verdicts = lambda rec: {
+            s["session_id"]: (s["ok"], s["target_state"])
+            for s in rec["verdict"]["sessions"]}
+        self.assertEqual(verdicts(a), verdicts(b))
+        self.assertEqual(a["verdict"]["publishable"],
+                         b["verdict"]["publishable"])
+        self.assertEqual(a["verdict"]["matched_pairs"],
+                         b["verdict"]["matched_pairs"])
+
+    def test_retransmit_and_reopen_keep_single_published_conclusion(self):
+        rec = self.svc.freeze("M-F3", OLD_FOLDED, NEW_FOLDED, SESSIONS_FOLDED)
+        # 相同稳定迁移标识的等价重传：同一冻结结论
+        again = self.svc.freeze("M-F3", OLD_FOLDED, NEW_FOLDED, SESSIONS_FOLDED)
+        self.assertEqual(again["snapshot_hash"], rec["snapshot_hash"])
+        pub = self.svc.publish("M-F3", rec["snapshot_hash"])
+        # 发布重传：同一已发布结论
+        repub = self.svc.publish("M-F3", rec["snapshot_hash"])
+        self.assertEqual(repub["stage"], "PUBLISHED")
+        self.assertEqual(repub["snapshot_hash"], pub["snapshot_hash"])
+        # 进程重开：唯一已发布结论原样保留，含两份会话证据
+        self.store.close()
+        store2 = Store(self.db)
+        self.addCleanup(store2.close)
+        self.assertEqual(store2.recover_interrupted(), [])
+        svc2 = DecisionService(store2)
+        got = svc2.get("M-F3")
+        self.assertEqual(got["stage"], "PUBLISHED")
+        self.assertEqual(got["snapshot_hash"], rec["snapshot_hash"])
+        verdicts = {s["session_id"]: s for s in got["verdict"]["sessions"]}
+        self.assertEqual(set(verdicts), {"S1", "S2"})
+        self.assertTrue(all(s["ok"] and s["target_state"] == "SEALED"
+                            for s in verdicts.values()))
+        self.assertEqual(len(store2.list()), 1)
+
+    def test_broken_successor_among_folded_sessions_blocks_candidate(self):
+        rec = self.svc.freeze("M-F4", OLD_FOLDED_BROKEN, NEW_FOLDED,
+                              SESSIONS_FOLDED)
+        self.assertFalse(rec["verdict"]["publishable"])
+        verdicts = {s["session_id"]: s for s in rec["verdict"]["sessions"]}
+        self.assertTrue(verdicts["S1"]["ok"])
+        self.assertFalse(verdicts["S2"]["ok"])
+        self.assertEqual(verdicts["S2"]["blocking_path"][-1]["reason"],
+                         "output_mismatch")
+        with self.assertRaises(ConflictError) as ctx:
+            self.svc.publish("M-F4", rec["snapshot_hash"])
+        self.assertEqual(ctx.exception.code, "not_publishable")
 
 
 class StaleSnapshotDetectionTests(StoreTestBase):
