@@ -42,6 +42,30 @@ NEW_MISSING = {"name": "isol", "version": "v2", "start": "LOCKED", "states": {
     "TRIPPED": {"output": "黄灯", "actions": {"reset": "LOCKED"}},
 }}
 
+# 折叠案例：两个行为等价、仅名称不同的旧状态折叠为同一新状态
+FOLD_OLD = {"name": "isol", "version": "v1", "start": "ARMED_A", "states": {
+    "ARMED_A": {"output": "警戒", "actions": {"disarm": "SAFE"}},
+    "ARMED_B": {"output": "警戒", "actions": {"disarm": "SAFE"}},
+    "SAFE":    {"output": "安全", "actions": {"arm": "ARMED_A"}},
+}}
+FOLD_NEW = {"name": "isol", "version": "v2", "start": "ARMED", "states": {
+    "ARMED": {"output": "警戒", "actions": {"disarm": "SAFE"}},
+    "SAFE":  {"output": "安全", "actions": {"arm": "ARMED"}},
+}}
+FOLD_SESSIONS = [
+    {"session_id": "S1", "spec_version": "v1", "state": "ARMED_A",
+     "target_state": "ARMED", "observed_output": "警戒"},
+    {"session_id": "S2", "spec_version": "v1", "state": "ARMED_B",
+     "target_state": "ARMED", "observed_output": "警戒"},
+]
+# S2 的 disarm 后继与折叠目标不匹配（输出不同的 BROKEN）
+FOLD_OLD_BAD = {"name": "isol", "version": "v1", "start": "ARMED_A", "states": {
+    "ARMED_A": {"output": "警戒", "actions": {"disarm": "SAFE"}},
+    "ARMED_B": {"output": "警戒", "actions": {"disarm": "BROKEN"}},
+    "SAFE":    {"output": "安全", "actions": {"arm": "ARMED_A"}},
+    "BROKEN":  {"output": "停运", "actions": {}},
+}}
+
 
 def step(title: str) -> None:
     print("\n" + "=" * 68)
@@ -177,6 +201,62 @@ def check_http_smoke() -> bool:
     expect(status == 409 and wrong["error"] == "snapshot_mismatch",
            "案例C 错误快照哈希发布 => 409 拒绝")
 
+    # --- 案例 D：两个不同旧状态折叠进同一等价新状态 -------------------
+    fold_body = {"migration_id": "VER-FOLD", "old_spec": FOLD_OLD,
+                 "new_spec": FOLD_NEW, "sessions": FOLD_SESSIONS}
+    status, rec = http("POST", "/api/decisions/freeze", fold_body)
+    expect(status == 200 and rec["verdict"]["publishable"],
+           "案例D 折叠：两个等价旧状态共同迁入同一新状态 => publishable=true")
+    expect({(s["session_id"], s["ok"], s["target_state"])
+            for s in rec["verdict"]["sessions"]}
+           == {("S1", True, "ARMED"), ("S2", True, "ARMED")},
+           "案例D 两份会话各自保留证据且目标状态同为 ARMED")
+    expect({(p["old_state"], p["new_state"])
+            for p in rec["verdict"]["matched_pairs"]}
+           >= {("ARMED_A", "ARMED"), ("ARMED_B", "ARMED")},
+           "案例D 映射证据包含 (ARMED_A,ARMED) 与 (ARMED_B,ARMED) 两对")
+    status, pub = http("POST", "/api/decisions/VER-FOLD/publish",
+                       {"snapshot_hash": rec["snapshot_hash"]})
+    expect(status == 200 and pub["stage"] == "PUBLISHED",
+           "案例D 折叠候选成功发布")
+    # 等价重传：相同稳定迁移标识 + 相同载荷 => 同一已发布结论
+    status, again = http("POST", "/api/decisions/freeze", fold_body)
+    expect(status == 200 and again["stage"] == "PUBLISHED"
+           and again["snapshot_hash"] == rec["snapshot_hash"],
+           "案例D 同标识等价重传返回同一已发布结论")
+    status, got = http("GET", "/api/decisions/VER-FOLD")
+    expect(status == 200 and got["stage"] == "PUBLISHED"
+           and [s["session_id"] for s in got["sessions"]] == ["S1", "S2"],
+           "案例D 发布后查询返回含两份会话证据的同一结论")
+
+    # 交换会话录入顺序：裁决结果不得改变
+    status, swapped = http("POST", "/api/decisions/freeze", {
+        "migration_id": "VER-FOLD-SWAP", "old_spec": FOLD_OLD,
+        "new_spec": FOLD_NEW,
+        "sessions": list(reversed(FOLD_SESSIONS))})
+    expect(status == 200 and swapped["verdict"]["publishable"]
+           and {(s["session_id"], s["ok"], s["target_state"])
+                for s in swapped["verdict"]["sessions"]}
+           == {("S1", True, "ARMED"), ("S2", True, "ARMED")},
+           "案例D 交换会话顺序裁决不变")
+
+    # --- 案例 E：折叠中一个会话后继不匹配 => 阻断整个候选 -------------
+    status, rec = http("POST", "/api/decisions/freeze", {
+        "migration_id": "VER-FOLD-BAD", "old_spec": FOLD_OLD_BAD,
+        "new_spec": FOLD_NEW, "sessions": FOLD_SESSIONS})
+    sv = next(s for s in rec["verdict"]["sessions"]
+              if s["session_id"] == "S2")
+    expect(status == 200 and not rec["verdict"]["publishable"],
+           "案例E 折叠后继不匹配：publishable=false")
+    expect(sv["blocking_path"] and sv["blocking_path"][0]["action"] == "disarm"
+           and sv["blocking_path"][-1]["action"] is None
+           and sv["blocking_path"][-1]["reason"] == "output_mismatch",
+           "案例E 给出原有的首个阻断路径（disarm 下钻至 output_mismatch）")
+    status, err = http("POST", "/api/decisions/VER-FOLD-BAD/publish",
+                       {"snapshot_hash": rec["snapshot_hash"]})
+    expect(status == 409 and err["error"] == "not_publishable",
+           "案例E 阻断候选发布被拒绝（409 not_publishable）")
+
     return not failures
 
 
@@ -257,6 +337,40 @@ def check_recovery() -> bool:
             print(p2.stderr)
         print("  ✓ " if cond else "  ✗ ", end="")
         print("切换后中断、重开 => 唯一已发布结论（摘要/会话/证据完整绑定）")
+        ok &= cond
+
+        # 进程 5：折叠候选（两个等价旧状态 -> 同一新状态）冻结并发布
+        p = run_subprocess(
+            "import sys; "
+            "OLD=%r; NEW=%r; "
+            "SESS=%r; "
+            "s=Store(sys.argv[1]); svc=DecisionService(s); "
+            "r=svc.freeze('RC-3', OLD, NEW, SESS); "
+            "svc.publish('RC-3', r['snapshot_hash']); "
+            "print(r['snapshot_hash']); s.close()"
+            % (FOLD_OLD, FOLD_NEW, FOLD_SESSIONS))
+        h = p.stdout.strip().splitlines()[-1] if p.returncode == 0 else ""
+        cond = bool(h)
+        if not cond:
+            print(p.stderr)
+        # 进程 6：重开，折叠的已发布结论须原样保留且含两份会话证据
+        p2 = run_subprocess(
+            "import sys,json; s=Store(sys.argv[1]); s.recover_interrupted(); "
+            "r=s.get('RC-3'); "
+            "print(json.dumps({'stage':r['stage'],'hash':r['snapshot_hash'],"
+            "'sessions':[ (x['session_id'],x['target_state']) "
+            "             for x in r['sessions'] ],"
+            "'publishable':r['verdict']['publishable']})); s.close()")
+        if p2.returncode == 0:
+            out = json.loads(p2.stdout.strip().splitlines()[-1])
+            cond &= (out["stage"] == "PUBLISHED" and out["hash"] == h
+                     and out["sessions"] == [["S1", "ARMED"], ["S2", "ARMED"]]
+                     and out["publishable"] is True)
+        else:
+            cond = False
+            print(p2.stderr)
+        print("  ✓ " if cond else "  ✗ ", end="")
+        print("折叠候选发布后重开 => 同一已发布结论，两份会话证据完整")
         ok &= cond
     return ok
 

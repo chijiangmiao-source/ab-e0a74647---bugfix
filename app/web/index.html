@@ -63,6 +63,7 @@ pre.json { background:#0c1220; border:1px solid var(--line); border-radius:8px;
   <span id="health" class="badge">健康检测中…</span>
   <span class="spacer"></span>
   <button class="ghost" id="btn-example-ok">填充示例：可迁移</button>
+  <button class="ghost" id="btn-example-fold">填充示例：状态折叠</button>
   <button class="ghost" id="btn-example-miss">填充示例：动作缺失</button>
 </header>
 
@@ -233,6 +234,23 @@ const EXAMPLES = {
     ],
     mid: "cutover-2026-10-07-ok",
   },
+  fold: {
+    old: { name: "isol", version: "v1", start: "ARMED_A", states: [
+      ["ARMED_A", "警戒", { disarm: "SAFE" }],
+      ["ARMED_B", "警戒", { disarm: "SAFE" }],
+      ["SAFE", "安全", { arm: "ARMED_A" }],
+    ]},
+    neu: { name: "isol", version: "v2", start: "ARMED", states: [
+      ["ARMED", "警戒", { disarm: "SAFE" }],
+      ["SAFE", "安全", { arm: "ARMED" }],
+    ]},
+    // 两个名称不同但行为等价的旧状态，折叠迁入同一新状态 ARMED
+    sessions: [
+      ["S-001", "v1", "ARMED_A", "ARMED", "警戒"],
+      ["S-002", "v1", "ARMED_B", "ARMED", "警戒"],
+    ],
+    mid: "cutover-2026-10-07-fold",
+  },
   miss: {
     old: { name: "isol", version: "v1", start: "LOCKED", states: [
       ["LOCKED", "红灯", { unlock: "OPEN" }],
@@ -264,11 +282,14 @@ function loadExample(key) {
         Object.entries(a).map(([k, v]) => `${k}:${v}`).join("\n")));
   });
   $("sessions").innerHTML = "";
-  ex.sessions.forEach(([id, ver, st, out, tgt]) => sessRow(id, ver, st, tgt || "", out));
+  // 会话元组约定：[会话ID, 规程版本, 当前状态(旧), 目标状态(新), 观察输出]
+  ex.sessions.forEach(([id, ver, st, tgt, out]) =>
+    sessRow(id, ver, st, tgt || "", out));
   $("migration-id").value = ex.mid;
   $("error").textContent = "";
 }
 $("btn-example-ok").onclick = () => loadExample("ok");
+$("btn-example-fold").onclick = () => loadExample("fold");
 $("btn-example-miss").onclick = () => loadExample("miss");
 
 /* ---------- 裁决结果渲染 ---------- */

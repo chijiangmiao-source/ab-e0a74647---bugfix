@@ -47,6 +47,12 @@ class StoreTestBase(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
+    def _reopen(self) -> Store:
+        self.store.close()
+        store = Store(self.db)
+        self.addCleanup(store.close)
+        return store
+
 
 class FreezePublishTests(StoreTestBase):
     def test_freeze_binds_summary_sessions_evidence_stage_together(self):
@@ -139,12 +145,6 @@ class RetransmitAndCompetitionTests(StoreTestBase):
 
 
 class CrashRecoveryTests(StoreTestBase):
-    def _reopen(self) -> Store:
-        self.store.close()
-        store = Store(self.db)
-        self.addCleanup(store.close)
-        return store
-
     def test_interrupted_after_freeze_recovers_to_unpublished(self):
         rec = self.svc.freeze("M-C1", OLD_PAYLOAD, NEW_PAYLOAD, SESSIONS_OK)
         self.assertEqual(rec["stage"], "FROZEN")
@@ -188,6 +188,108 @@ class CrashRecoveryTests(StoreTestBase):
         row = store2.get("M-C3")
         self.assertIn(row["stage"], ("FROZEN", "PUBLISHED"))
         self.assertEqual(row["stage"], "PUBLISHED")
+
+
+FOLD_OLD_PAYLOAD = {"name": "isol", "version": "v1", "start": "ARMED_A", "states": {
+    "ARMED_A": {"output": "警戒", "actions": {"disarm": "SAFE"}},
+    "ARMED_B": {"output": "警戒", "actions": {"disarm": "SAFE"}},
+    "SAFE":    {"output": "安全", "actions": {"arm": "ARMED_A"}},
+}}
+FOLD_NEW_PAYLOAD = {"name": "isol", "version": "v2", "start": "ARMED", "states": {
+    "ARMED": {"output": "警戒", "actions": {"disarm": "SAFE"}},
+    "SAFE":  {"output": "安全", "actions": {"arm": "ARMED"}},
+}}
+# ARMED_B 的 disarm 后继与折叠目标不等价
+FOLD_OLD_BROKEN = {"name": "isol", "version": "v1", "start": "ARMED_A", "states": {
+    "ARMED_A": {"output": "警戒", "actions": {"disarm": "SAFE"}},
+    "ARMED_B": {"output": "警戒", "actions": {"disarm": "BROKEN"}},
+    "SAFE":    {"output": "安全", "actions": {"arm": "ARMED_A"}},
+    "BROKEN":  {"output": "停运", "actions": {}},
+}}
+FOLD_SESSIONS_A = [
+    {"session_id": "S1", "spec_version": "v1", "state": "ARMED_A",
+     "target_state": "ARMED", "observed_output": "警戒"},
+    {"session_id": "S2", "spec_version": "v1", "state": "ARMED_B",
+     "target_state": "ARMED", "observed_output": "警戒"},
+]
+
+
+class FoldEquivalentStatesTests(StoreTestBase):
+    """两个不同旧状态折叠进同一等价新状态：各自独立证据、同一目标状态。"""
+
+    def test_fold_freeze_publishable_with_independent_session_evidence(self):
+        rec = self.svc.freeze("F-1", FOLD_OLD_PAYLOAD, FOLD_NEW_PAYLOAD,
+                              FOLD_SESSIONS_A)
+        v = rec["verdict"]
+        self.assertTrue(v["publishable"])
+        self.assertEqual(
+            {s["session_id"]: (s["ok"], s["target_state"]) for s in v["sessions"]},
+            {"S1": (True, "ARMED"), "S2": (True, "ARMED")})
+        pairs = {(p["old_state"], p["new_state"]) for p in v["matched_pairs"]}
+        self.assertEqual(pairs, {("ARMED_A", "ARMED"),
+                                 ("ARMED_B", "ARMED"),
+                                 ("SAFE", "SAFE")})
+
+    def test_fold_publish_succeeds_and_is_retransmittable(self):
+        rec = self.svc.freeze("F-2", FOLD_OLD_PAYLOAD, FOLD_NEW_PAYLOAD,
+                              FOLD_SESSIONS_A)
+        pub = self.svc.publish("F-2", rec["snapshot_hash"])
+        self.assertEqual(pub["stage"], "PUBLISHED")
+        # 已发布结论包含两份会话证据
+        self.assertEqual({s["session_id"] for s in pub["sessions"]}, {"S1", "S2"})
+        # 相同稳定迁移标识、相同载荷的等价重传 => 同一已发布结论
+        again = self.svc.freeze("F-2", FOLD_OLD_PAYLOAD, FOLD_NEW_PAYLOAD,
+                                FOLD_SESSIONS_A)
+        self.assertEqual(again["stage"], "PUBLISHED")
+        self.assertEqual(again["snapshot_hash"], rec["snapshot_hash"])
+        again_pub = self.svc.publish("F-2", rec["snapshot_hash"])
+        self.assertEqual(again_pub["snapshot_hash"], pub["snapshot_hash"])
+
+    def test_fold_session_order_swap_gives_same_verdict(self):
+        swapped = list(reversed(FOLD_SESSIONS_A))
+        r1 = self.svc.freeze("F-3a", FOLD_OLD_PAYLOAD, FOLD_NEW_PAYLOAD,
+                             FOLD_SESSIONS_A)
+        r2 = self.svc.freeze("F-3b", FOLD_OLD_PAYLOAD, FOLD_NEW_PAYLOAD,
+                             swapped)
+        key = {s["session_id"]: (s["ok"], s["target_state"])
+               for s in r1["verdict"]["sessions"]}
+        self.assertEqual(
+            key,
+            {s["session_id"]: (s["ok"], s["target_state"])
+             for s in r2["verdict"]["sessions"]})
+        self.assertTrue(r1["verdict"]["publishable"]
+                        is r2["verdict"]["publishable"] is True)
+
+    def test_fold_successor_mismatch_blocks_publish(self):
+        rec = self.svc.freeze("F-4", FOLD_OLD_BROKEN, FOLD_NEW_PAYLOAD,
+                              FOLD_SESSIONS_A)
+        self.assertFalse(rec["verdict"]["publishable"])
+        bad = next(s for s in rec["verdict"]["sessions"]
+                   if s["session_id"] == "S2")
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad["blocking_path"][0]["action"], "disarm")
+        self.assertEqual(bad["blocking_path"][-1]["reason"], "output_mismatch")
+        with self.assertRaises(ConflictError) as ctx:
+            self.svc.publish("F-4", rec["snapshot_hash"])
+        self.assertEqual(ctx.exception.code, "not_publishable")
+
+    def test_fold_published_conclusion_survives_process_reopen(self):
+        rec = self.svc.freeze("F-5", FOLD_OLD_PAYLOAD, FOLD_NEW_PAYLOAD,
+                              FOLD_SESSIONS_A)
+        self.svc.publish("F-5", rec["snapshot_hash"])
+        store2 = self._reopen()
+        self.assertEqual(store2.recover_interrupted(), [])
+        row = store2.get("F-5")
+        self.assertEqual(row["stage"], "PUBLISHED")
+        self.assertEqual(row["snapshot_hash"], rec["snapshot_hash"])
+        # 重开后仍返回包含两份会话证据的同一已发布结论
+        self.assertEqual([s["session_id"] for s in row["sessions"]],
+                         ["S1", "S2"])
+        self.assertTrue(row["verdict"]["publishable"])
+        self.assertEqual(
+            {s["session_id"]: s["target_state"]
+             for s in row["verdict"]["sessions"]},
+            {"S1": "ARMED", "S2": "ARMED"})
 
 
 class StaleSnapshotDetectionTests(StoreTestBase):

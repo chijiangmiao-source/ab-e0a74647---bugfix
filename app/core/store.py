@@ -109,6 +109,8 @@ class Store:
                             "禁止混用",
                             existing=_row_to_dict(row),
                         )
+                    # 幂等重传：结束本次只读事务，避免向后续写操作泄漏开放事务
+                    self._conn.commit()
                     return row["stage"], _row_to_dict(row)
 
                 now = _utcnow()
@@ -160,6 +162,7 @@ class Store:
                             "禁止混用",
                             existing=_row_to_dict(row),
                         )
+                    self._conn.commit()
                     return _row_to_dict(row)  # 幂等重传
                 if row["snapshot_hash"] != snapshot_hash:
                     raise ConflictError(
@@ -172,19 +175,6 @@ class Store:
                     raise ConflictError(
                         "not_publishable",
                         f"迁移标识 {migration_id!r} 存在不可映射会话，候选不得发布",
-                        existing=_row_to_dict(row),
-                    )
-                seen_targets: Dict[str, str] = {}
-                for session in json.loads(row["sessions"]):
-                    target_state = session["target_state"]
-                    previous_session = seen_targets.get(target_state)
-                    if previous_session is None:
-                        seen_targets[target_state] = session["session_id"]
-                        continue
-                    raise ConflictError(
-                        "target_collision",
-                        f"目标状态 {target_state!r} 同时分配给会话 "
-                        f"{previous_session!r} 与 {session['session_id']!r}",
                         existing=_row_to_dict(row),
                     )
                 self._conn.execute(

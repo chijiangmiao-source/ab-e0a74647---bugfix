@@ -72,32 +72,10 @@ class DecisionService:
 
         result = compute_bisimulation(old, new, sessions)
         verdict = result.to_json()
-        claimed_targets: Dict[str, str] = {}
-        for session_verdict in verdict["sessions"]:
-            target_state = session_verdict["target_state"]
-            if not session_verdict["ok"] or target_state is None:
-                continue
-            previous_session = claimed_targets.get(target_state)
-            if previous_session is None:
-                claimed_targets[target_state] = session_verdict["session_id"]
-                continue
-            session_verdict["ok"] = False
-            session_verdict["target_state"] = None
-            session_verdict["blocking_path"] = [{
-                "step": 1,
-                "old_state": next(
-                    s.state for s in sessions
-                    if s.session_id == session_verdict["session_id"]
-                ),
-                "new_state": target_state,
-                "action": None,
-                "to_old": None,
-                "to_new": None,
-                "reason": "target_already_claimed",
-                "detail": f"目标状态 {target_state!r} 已由会话 {previous_session!r} 预留",
-            }]
-        verdict["publishable"] = all(item["ok"] for item in verdict["sessions"])
-        # 映射证据：匹配状态对 + 逐会话结论
+        # 多个行为等价的旧状态折叠为同一个新状态是协议升级的合法场景：
+        # 只要各会话种子对都落在最大双向匹配关系内，它们可以同时指向同一
+        # 目标状态，每个会话保留各自独立的匹配证据。是否可迁入只由
+        # compute_bisimulation 判定，这里不再做“目标状态唯一”限制。
         verdict["evidence"] = {
             "rule": "greatest bisimulation over reachable pairs "
                     "(equal outputs, equal allowed actions, matched successors)",

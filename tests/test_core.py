@@ -179,6 +179,84 @@ class NotJustStartStateTests(unittest.TestCase):
         self.assertFalse(by_id["bad"].ok)
 
 
+class FoldEquivalentStatesTests(unittest.TestCase):
+    """协议升级把多个行为等价的旧状态折叠为同一个新状态。
+
+    旧规程有两个输出/允许动作/后继行为完全一致的状态 ARMED_A、ARMED_B
+    （仅名称不同），新规程用单一 ARMED 表示这份等价行为。
+    """
+
+    FOLD_OLD = {
+        "ARMED_A": {"output": "警戒", "actions": {"disarm": "SAFE"}},
+        "ARMED_B": {"output": "警戒", "actions": {"disarm": "SAFE"}},
+        "SAFE":    {"output": "安全", "actions": {"arm": "ARMED_A"}},
+    }
+    FOLD_NEW = {
+        "ARMED": {"output": "警戒", "actions": {"disarm": "SAFE"}},
+        "SAFE":  {"output": "安全", "actions": {"arm": "ARMED"}},
+    }
+    # ARMED_B 的 disarm 后继在折叠目标下行为不一致
+    FOLD_OLD_BROKEN = {
+        "ARMED_A": {"output": "警戒", "actions": {"disarm": "SAFE"}},
+        "ARMED_B": {"output": "警戒", "actions": {"disarm": "BROKEN"}},
+        "SAFE":    {"output": "安全", "actions": {"arm": "ARMED_A"}},
+        "BROKEN":  {"output": "停运", "actions": {}},
+    }
+
+    def _result(self, sessions, old_states=FOLD_OLD):
+        old, _ = make_spec("isol", "ARMED_A", old_states, "v1")
+        new, _ = make_spec("isol2", "ARMED", self.FOLD_NEW, "v2")
+        return compute_bisimulation(old, new, sessions)
+
+    def test_two_distinct_old_states_fold_into_one_new_state(self):
+        sessions = [
+            snap("S1", "ARMED_A", target="ARMED", observed="警戒"),
+            snap("S2", "ARMED_B", target="ARMED", observed="警戒"),
+        ]
+        res = self._result(sessions)
+        self.assertTrue(res.publishable)
+        # 两个会话各自保留独立证据，同时得到同一个目标状态
+        self.assertEqual(
+            {s.session_id: (s.ok, s.target_state) for s in res.sessions},
+            {"S1": (True, "ARMED"), "S2": (True, "ARMED")})
+        pairs = {(p["old_state"], p["new_state"]) for p in res.pairs}
+        self.assertIn(("ARMED_A", "ARMED"), pairs)
+        self.assertIn(("ARMED_B", "ARMED"), pairs)
+
+    def test_session_entry_order_does_not_change_verdict(self):
+        forward = [
+            snap("S1", "ARMED_A", target="ARMED"),
+            snap("S2", "ARMED_B", target="ARMED"),
+        ]
+        backward = list(reversed(forward))
+        r1 = self._result(forward)
+        r2 = self._result(backward)
+        self.assertTrue(r1.publishable and r2.publishable)
+        v1 = {s.session_id: (s.ok, s.target_state) for s in r1.sessions}
+        v2 = {s.session_id: (s.ok, s.target_state) for s in r2.sessions}
+        self.assertEqual(v1, v2)
+        self.assertEqual(
+            {(p["old_state"], p["new_state"]) for p in r1.pairs},
+            {(p["old_state"], p["new_state"]) for p in r2.pairs})
+
+    def test_fold_with_one_successor_mismatch_blocks_whole_candidate(self):
+        sessions = [
+            snap("S1", "ARMED_A", target="ARMED"),
+            snap("S2", "ARMED_B", target="ARMED"),
+        ]
+        res = self._result(sessions, old_states=self.FOLD_OLD_BROKEN)
+        self.assertFalse(res.publishable, "一个会话后继不匹配必须阻断整个候选")
+        by_id = {s.session_id: s for s in res.sessions}
+        self.assertTrue(by_id["S1"].ok)
+        bad = by_id["S2"]
+        self.assertFalse(bad.ok)
+        self.assertIsNone(bad.target_state)
+        # 仍须给出原有的首个阻断路径：先沿 disarm 下钻，再在后继处报输出冲突
+        self.assertEqual([s.action for s in bad.blocking_path if s.action],
+                         ["disarm"])
+        self.assertEqual(bad.blocking_path[-1].reason, "output_mismatch")
+
+
 class StaleSnapshotTests(unittest.TestCase):
     def test_observed_output_inconsistent_rejected(self):
         old, _ = make_spec("isol", "LOCKED", OLD, version="v1")
